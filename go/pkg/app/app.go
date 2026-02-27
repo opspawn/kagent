@@ -52,6 +52,7 @@ import (
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
 	"github.com/kagent-dev/kagent/go/pkg/auth"
+	dbpkg "github.com/kagent-dev/kagent/go/pkg/database"
 	"github.com/kagent-dev/kagent/go/pkg/mcp_translator"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
@@ -190,9 +191,10 @@ func LoadFromEnv(fs *flag.FlagSet) error {
 }
 
 type BootstrapConfig struct {
-	Ctx     context.Context
-	Manager manager.Manager
-	Router  *mux.Router
+	Ctx      context.Context
+	Manager  manager.Manager
+	Router   *mux.Router
+	DbClient dbpkg.Client
 }
 
 type CtrlManagerConfigFunc func(manager.Manager) error
@@ -365,9 +367,10 @@ func Start(getExtensionConfig GetExtensionConfig) {
 	dbClient := database.NewClient(dbManager)
 	router := mux.NewRouter()
 	extensionCfg, err := getExtensionConfig(BootstrapConfig{
-		Ctx:     ctx,
-		Manager: mgr,
-		Router:  router,
+		Ctx:      ctx,
+		Manager:  mgr,
+		Router:   router,
+		DbClient: dbClient,
 	})
 	if err != nil {
 		setupLog.Error(err, "unable to get start config")
@@ -419,6 +422,14 @@ func Start(getExtensionConfig GetExtensionConfig) {
 		Reconciler: rcnclr,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "ModelConfig")
+		os.Exit(1)
+	}
+
+	if err = (&controller.ModelProviderConfigController{
+		Scheme:     mgr.GetScheme(),
+		Reconciler: rcnclr,
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "ModelProviderConfig")
 		os.Exit(1)
 	}
 
@@ -505,6 +516,7 @@ func Start(getExtensionConfig GetExtensionConfig) {
 		Authorizer:        extensionCfg.Authorizer,
 		Authenticator:     extensionCfg.Authenticator,
 		ProxyURL:          cfg.Proxy.URL,
+		Reconciler:        rcnclr,
 	})
 	if err != nil {
 		setupLog.Error(err, "unable to create HTTP server")

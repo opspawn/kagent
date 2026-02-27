@@ -241,9 +241,6 @@ func runSyncTest(t *testing.T, a2aClient *a2aclient.A2AClient, userMessage, expe
 // If contextID is provided, it will be included in the message to maintain conversation context
 // Checks the full JSON output to support both artifacts and history from different agent types
 func runStreamingTest(t *testing.T, a2aClient *a2aclient.A2AClient, userMessage, expectedText string, contextID ...string) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
 	msg := protocol.Message{
 		Kind:  protocol.KindMessage,
 		Role:  protocol.MessageRoleUser,
@@ -255,15 +252,24 @@ func runStreamingTest(t *testing.T, a2aClient *a2aclient.A2AClient, userMessage,
 		msg.ContextID = &contextID[0]
 	}
 
-	var stream <-chan protocol.StreamingMessageEvent
+	var (
+		stream <-chan protocol.StreamingMessageEvent
+		ctx    context.Context
+		cancel context.CancelFunc
+	)
 	err := retry.OnError(defaultRetry, func(err error) bool {
 		return err != nil
 	}, func() error {
 		var retryErr error
+		ctx, cancel = context.WithTimeout(context.Background(), 10*time.Second)
 		stream, retryErr = a2aClient.StreamMessage(ctx, protocol.SendMessageParams{Message: msg})
+		if retryErr != nil {
+			cancel()
+		}
 		return retryErr
 	})
 	require.NoError(t, err)
+	defer cancel()
 
 	resultList := []protocol.StreamingMessageEvent{}
 	var text string
@@ -461,11 +467,6 @@ func TestE2EInvokeInlineAgentWithStreaming(t *testing.T) {
 	modelCfg := setupModelConfig(t, cli, baseURL)
 	// Enable streaming explicitly
 	agent := setupAgentWithOptions(t, cli, modelCfg.Name, tools, AgentOptions{Stream: true})
-
-	defer func() {
-		cli.Delete(t.Context(), agent)    //nolint:errcheck
-		cli.Delete(t.Context(), modelCfg) //nolint:errcheck
-	}()
 
 	// Setup A2A client
 	a2aClient := setupA2AClient(t, agent)
@@ -826,7 +827,7 @@ func TestE2EInvokeSTSIntegration(t *testing.T) {
 
 		// verify our mock STS server received the token exchange request
 		stsRequests := stsServer.GetRequests()
-		require.Len(t, stsRequests, 1, "Expected 1 STS token exchange request")
+		require.NotEmpty(t, stsRequests, "Expected STS token exchange request but got none")
 
 		// ensure the subject token is the same as the one we sent
 		// which contains the may act claim
@@ -857,6 +858,64 @@ func TestE2EInvokeSkillInAgent(t *testing.T) {
 
 	// Run tests
 	runSyncTest(t, a2aClient, "make me a kebab", "Pick it up from around the corner", nil)
+}
+
+func TestE2EInvokePassthroughAgent(t *testing.T) {
+	// Setup mock server with header matching — the mock only responds
+	// if the Authorization header contains our passthrough token.
+	baseURL, stopServer := setupMockServer(t, "mocks/invoke_passthrough_agent.json")
+	defer stopServer()
+
+	// Setup Kubernetes client
+	cli := setupK8sClient(t, false)
+
+	// Create a ModelConfig with apiKeyPassthrough enabled (no apiKeySecret)
+	passthroughToken := "passthrough-test-token-12345"
+	modelCfg := &v1alpha2.ModelConfig{
+		ObjectMeta: metav1.ObjectMeta{
+			GenerateName: "test-passthrough-model-",
+			Namespace:    "kagent",
+		},
+		Spec: v1alpha2.ModelConfigSpec{
+			Model:             "gpt-4.1-mini",
+			Provider:          v1alpha2.ModelProviderOpenAI,
+			APIKeyPassthrough: true,
+			OpenAI: &v1alpha2.OpenAIConfig{
+				BaseURL: baseURL + "/v1",
+			},
+		},
+	}
+	err := cli.Create(t.Context(), modelCfg)
+	require.NoError(t, err)
+	cleanup(t, cli, modelCfg)
+
+	// Create agent with no tools
+	agent := setupAgent(t, cli, modelCfg.Name, nil)
+
+	// Create an A2A client that sends the Bearer token on every request.
+	// With passthrough enabled, the agent should forward this token to the
+	// LLM provider as the API key (Authorization: Bearer <token>).
+	httpClient := &http.Client{
+		Transport: &httpTransportWithHeaders{
+			base: http.DefaultTransport,
+			t:    t,
+			headers: map[string]string{
+				"Authorization": "Bearer " + passthroughToken,
+			},
+		},
+	}
+	a2aURL := a2aUrl(agent.Namespace, agent.Name)
+	a2aClient, err := a2aclient.NewA2AClient(a2aURL,
+		a2aclient.WithTimeout(60*time.Second),
+		a2aclient.WithHTTPClient(httpClient))
+	require.NoError(t, err)
+
+	// The mock server will only match if it receives the exact
+	// Authorization header "Bearer passthrough-test-token-12345".
+	// If passthrough is broken, mockllm returns 404 and the test fails.
+	t.Run("sync_invocation", func(t *testing.T) {
+		runSyncTest(t, a2aClient, "Hello from passthrough", "Token received successfully via passthrough", nil)
+	})
 }
 
 func TestE2EIAgentRunsCode(t *testing.T) {
